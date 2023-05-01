@@ -123,6 +123,28 @@ def ls_exit(pi,P,rev,beta,K,desc):
 
 
 def simulate_exit(ngfs_vars,SS,Nsim,rseed,r,decom_cost,pi0,Phi,Sigma,sig_fact,sigma_sig,W,R_C,C_F,C_V,emission_rate):
+    # Main function for performing the simulation; the computation is done several times depending on the length of r with the same rseed
+    # ngfs_vars : dictionary of NGFS variables
+    # SS : list of selected scenarios
+    # Nsim : number of trajectories
+    # rseed : random seed : calls with the same rseed use the same randomness
+    # r : interest rate (array of a given length)
+    # decom_cost : decommissioning cost as fraction of capital costs
+    # pi0 : initial scenario probabilities
+    # Sigma : covariance matrix of risk factors
+    # Phi : mean reversion matrix of risk factors
+    # sig_fact : vector of the same length as r containing values of multipliers for Sigma to apply at each computation
+    # sigma_sig : vector of the same length as r containing signal volatilities to apply at each computation
+    # W : plant capacity, MW
+    # R_C : plant efficiency
+    # C_F : fixed cost
+    # C_V : variable cost
+    # emission_rate
+    # Outputs :
+    # price, ub, lb, mtau, utau, ltau : price with upper and lower MC bounds, expected stopping times with upper and lower bounds
+    # all these variables are vectors of the same length as r
+    # tau is an 2d vector containing the stopping times for each simulation
+    # I is a vector of size Nsim containing the true scenario (they are the same for all simulations)
     beta = np.exp(-r)
     T_years = 30
     T_months = T_years*12
@@ -182,3 +204,89 @@ def simulate_exit(ngfs_vars,SS,Nsim,rseed,r,decom_cost,pi0,Phi,Sigma,sig_fact,si
     calc_time = time.time()
     print('Calculation time: ',calc_time-start_time)
     return price, ub, lb, mtau, utau, ltau, tau, I
+
+def simulate_exit_euro(ngfs_vars,SS,Nsim,rseed,r,decom_cost,pi0,Phi,Sigma,sig_fact,sigma_sig,W,R_C,C_F,C_V,emission_rate):
+    # Same as above but computes in addition the price and the upper and lower bounds for a plant operating for 30 years without stopping
+    beta = np.exp(-r)
+    T_years = 30
+    T_months = T_years*12
+    months = np.linspace(0,T_months,T_months+1)
+    years = np.linspace(0,T_years,T_years+1)
+    NGFS_years = np.linspace(0,T_years,7)
+    mu_sig = np.zeros((len(SS),T_months+1))
+    R_U_long = np.zeros((len(SS),T_years+1))
+    mu = np.zeros((3,len(SS),T_years+1))
+    scenarios =  ['Below 2°C', 'Current Policies', 'Delayed transition', 
+                  'Divergent Net Zero', 'Nationally Determined Contributions (NDCs)', 'Net Zero 2050']
+    
+    snames = [scenarios[i] for i in SS]
+    print("Selected scenarios: ",snames)
+    CC_C = np.interp(years,NGFS_years,ngfs_vars["CC"])
+    K = decom_cost*CC_C*W
+    HPY = 365.25*24
+
+
+    for i in range(len(SS)):
+        mu_sig[i,:] = np.interp(months/12,NGFS_years , ngfs_vars["emissions"][SS[i],:])
+        mu[0,i,:] = np.log(np.interp(years,NGFS_years  , ngfs_vars["P_E"][SS[i],:]))
+        mu[1,i,:] = np.log(np.interp(years,NGFS_years  , ngfs_vars["P_C"][SS[i],:]))
+        mu[2,i,:] = np.log(np.interp(years,NGFS_years  , ngfs_vars["P_CO2"][SS[i],:]))
+        R_U_long[i,:] = np.interp(years,NGFS_years,ngfs_vars["R_U"][SS[i],:])
+        
+    price = np.zeros(len(sig_fact))
+    ub = np.zeros(len(sig_fact))
+    lb = np.zeros(len(sig_fact))
+    mtau = np.zeros(len(sig_fact))
+    utau = np.zeros(len(sig_fact))
+    ltau = np.zeros(len(sig_fact))
+    tau = np.zeros((len(sig_fact),Nsim))
+    eprice = np.zeros(len(sig_fact))
+    eub = np.zeros(len(sig_fact))
+    elb = np.zeros(len(sig_fact))
+
+    sub_ind = np.arange(0,T_months+1,12,dtype=int)
+
+    revenues = lambda W,E,F,C,R_C,C_F,R_U,C_V: W*HPY*R_U*( E - F/R_C - emission_rate*C - C_V)- W*C_F 
+
+    
+    start_time = time.time()
+    for i in range(len(sig_fact)):
+        pi,lP,I = simTraj(Nsim,pi0,sig_fact[i]*Sigma,Phi,sigma_sig[i],mu_sig,sub_ind,rseed,str(i))
+        P = np.zeros(lP.shape)
+        for rf in range(3):
+            for t in range(T_years+1):
+                P[rf,:,t] = np.exp(lP[rf,:,t]+mu[rf,I,t])
+
+        rev = np.zeros((Nsim,T_years+1))
+        f = IntProgress(min=0, max=T_years+1,description="Revenues "+str(i)) # instantiate the bar
+        display(f) 
+        for t in range(T_years+1):
+            f.value+=1
+            rev[:,t] = revenues(W,P[0,:,t],P[1,:,t],P[2,:,t],R_C,C_F,R_U_long[I,t],C_V)
+        f.close()
+        price[i], ub[i], lb[i], mtau[i], utau[i], ltau[i], tau[i,:] = ls_exit(pi,lP,rev,beta[i],K,str(i))
+        eprice[i], eub[i], elb[i] = eur_price(rev,beta,K)
+
+    
+    calc_time = time.time()
+    print('Calculation time: ',calc_time-start_time)
+    return price, ub, lb, eprice, eub, elb, mtau, utau, ltau, tau, I
+
+
+def eur_price(rev,beta,K):
+    # Compute the price without stoping
+    # inputs : rev : revenues for each trajectory and date
+    # beta : discount factor
+    # K : capital cost
+    T = rev.shape[1]-1
+    Nsim = rev.shape[0]
+    disc = np.power(beta,np.arange(1,T+1))
+    dpayoff = np.zeros(Nsim)
+    for t in range(T):
+        dpayoff = dpayoff + rev[:,t+1]*disc[t]
+    al = 0.05
+    price = np.mean(dpayoff) - disc[-1]*K[-1]
+    SE = np.std(dpayoff)/np.sqrt(Nsim)
+    ub = price + norm.ppf(1-al/2)*SE 
+    lb = price - norm.ppf(1-al/2)*SE
+    return price, ub, lb
